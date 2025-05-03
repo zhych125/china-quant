@@ -1,0 +1,13 @@
+jupyter
+pandas
+matplotlib
+yfinance
+seaborn
+numpy
+pyarrow
+backtrader
+plotly
+ta
+xgboost==1.5.0
+scikit-learn
+seaborn
