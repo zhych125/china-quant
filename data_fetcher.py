@@ -4,13 +4,14 @@ import glob
 import pandas as pd
 import backtrader as bt
 from abc import ABC, abstractmethod
+import yfinance as yf
 
 
 class DataFetcher(ABC):
     """Interface for data fetchers that load financial data"""
 
     @abstractmethod
-    def get_data(self, symbol, start_date=None, end_date=None, years=None):
+    def get_data(self, symbol, start_date=None, end_date=None):
         """
         Get data for a symbol within a date range
 
@@ -18,12 +19,117 @@ class DataFetcher(ABC):
             symbol (str): The ticker symbol
             start_date (str or datetime, optional): Start date
             end_date (str or datetime, optional): End date
-            years (int, optional): Number of years of data to fetch
 
         Returns:
             DataFrame: Pandas DataFrame with the data
         """
         pass
+
+
+class YahooFinanceDataFetcher(DataFetcher):
+    """Fetches data directly from Yahoo Finance"""
+
+    def __init__(self, data_dir='data', auto_save=True):
+        """
+        Initialize the Yahoo Finance data fetcher
+
+        Args:
+            data_dir (str): Directory to save the data files
+            auto_save (bool): Whether to automatically save data to CSV file
+        """
+        self.data_dir = data_dir
+        self.auto_save = auto_save
+
+        # Create data directory if it doesn't exist
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+
+    def get_data(self, symbol, start_date=None, end_date=None):
+        """
+        Get stock data directly from Yahoo Finance
+
+        Args:
+            symbol (str): Stock symbol (e.g., 'AAPL')
+            start_date (str or datetime, optional): Start date
+            end_date (str or datetime, optional): End date
+
+        Returns:
+            DataFrame: Pandas DataFrame with OHLCV data
+        """
+        print(f"Fetching {symbol} data from Yahoo Finance...")
+
+        if start_date is None:
+            start_date = "2019-01-01"
+        if end_date is None:
+            end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+        # Format dates if they are datetime objects
+        if isinstance(start_date, datetime.datetime):
+            start_date = start_date.strftime("%Y-%m-%d")
+        if isinstance(end_date, datetime.datetime):
+            end_date = end_date.strftime("%Y-%m-%d")
+
+        print(f"Date range: {start_date} to {end_date}")
+
+        try:
+            # Download data from Yahoo Finance
+            df = yf.download(symbol, start=start_date, end=end_date)
+
+            if df.empty:
+                print(f"No data available for {symbol}")
+                return None
+
+            # Make sure index is a DatetimeIndex
+            if not isinstance(df.index, pd.DatetimeIndex):
+                print("Warning: DataFrame index is not a DatetimeIndex. Converting...")
+                df.index = pd.to_datetime(df.index)
+
+            print(f"Successfully retrieved {len(df)} rows of {symbol} data")
+            print(f"Data range: {df.index.min()} to {df.index.max()}")
+
+            # Apply explicit date filters if needed (yfinance should already do this,
+            # but we do it again for consistency)
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+
+            df = df[(df.index >= start_dt) & (df.index <= end_dt)]
+
+            # Auto-save if enabled
+            if self.auto_save:
+                self.save_data(df, symbol, start_date, end_date)
+
+            return df
+
+        except Exception as e:
+            print(f"Error fetching data for {symbol}: {e}")
+            return None
+
+    def save_data(self, df, symbol, start_date, end_date):
+        """
+        Save data to a CSV file
+
+        Args:
+            df (DataFrame): Data to save
+            symbol (str): Stock symbol
+            start_date (str): Start date
+            end_date (str): End date
+
+        Returns:
+            str: Path to the saved file
+        """
+        if df is None or df.empty:
+            print("No data to save")
+            return None
+
+        # Format filename
+        filename = f"{symbol}_{start_date}_{end_date}.csv"
+        file_path = os.path.join(self.data_dir, filename)
+
+        # Save to CSV
+        df.to_csv(file_path)
+        print(f"Data saved to: {file_path}")
+
+        return file_path
 
 
 class CSVDataFetcher(DataFetcher):
@@ -32,32 +138,53 @@ class CSVDataFetcher(DataFetcher):
     def __init__(self, data_dir='data'):
         self.data_dir = data_dir
 
-    def _find_csv_files(self, symbol, years=None):
-        """Find CSV files for a symbol with optional year filtering"""
+    def _find_csv_files(self, symbol, start_date=None, end_date=None):
+        """Find CSV files for a symbol with optional date filtering"""
         # Get all files for the symbol
         all_files = glob.glob(os.path.join(self.data_dir, f'{symbol}*.csv'))
 
-        if years is None:
-            return all_files
+        if not all_files:
+            return []
 
-        # Filter for files covering specific years
-        filtered_files = []
+        # If date filtering is required, try to find a file matching the date range
+        if start_date or end_date:
+            # Parse dates if they're strings
+            if isinstance(start_date, str):
+                start_date = pd.to_datetime(start_date)
+            if isinstance(end_date, str):
+                end_date = pd.to_datetime(end_date)
 
-        # Look for the specific year period in filename
-        if years == 3:
-            # Look for 2020-2023 (3 years)
+            filtered_files = []
             for file_path in all_files:
                 filename = os.path.basename(file_path)
-                if '2020-01-01_2023-12-31' in filename:
+                # Look for date pattern in filename (assuming format like SYMBOL_YYYY-MM-DD_YYYY-MM-DD.csv)
+                file_parts = filename.split('_')
+                if len(file_parts) >= 3:
+                    try:
+                        file_start = pd.to_datetime(file_parts[1])
+                        file_end = pd.to_datetime(file_parts[2].split('.')[0])
+
+                        # Check if file's date range overlaps with requested range
+                        if ((start_date is None or file_end >= start_date) and
+                            (end_date is None or file_start <= end_date)):
+                            filtered_files.append(file_path)
+                    except:
+                        # If we can't parse dates from filename, keep the file
+                        filtered_files.append(file_path)
+                else:
+                    # No date information in filename, keep the file
                     filtered_files.append(file_path)
 
+            if filtered_files:
+                return filtered_files
+
         # If no specific file is found, get the largest one as a fallback
-        if not filtered_files and all_files:
-            filtered_files = [sorted(all_files, key=os.path.getsize, reverse=True)[0]]
+        if all_files:
+            return [sorted(all_files, key=os.path.getsize, reverse=True)[0]]
 
-        return filtered_files
+        return []
 
-    def get_data(self, symbol, start_date=None, end_date=None, years=None):
+    def get_data(self, symbol, start_date=None, end_date=None):
         """
         Get stock data from CSV files
 
@@ -65,13 +192,12 @@ class CSVDataFetcher(DataFetcher):
             symbol (str): Stock symbol (e.g., 'AAPL')
             start_date (str or datetime, optional): Start date
             end_date (str or datetime, optional): End date
-            years (int, optional): Number of years of data
 
         Returns:
             DataFrame: Pandas DataFrame with OHLCV data
         """
         # Find the appropriate CSV files
-        csv_files = self._find_csv_files(symbol, years)
+        csv_files = self._find_csv_files(symbol, start_date, end_date)
 
         if not csv_files:
             print(f"No CSV files found for {symbol}")
@@ -81,24 +207,65 @@ class CSVDataFetcher(DataFetcher):
         file_path = csv_files[0]
         print(f"Loading data from: {file_path}")
 
-        # Read the CSV file
-        df = pd.read_csv(file_path)
+        try:
+            # Read the CSV file
+            df = pd.read_csv(file_path)
 
-        # Ensure the date column is parsed as datetime
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'])
-            df.set_index('Date', inplace=True)
+            # Check if 'Date' is already a column
+            if 'Date' in df.columns:
+                # Convert to datetime
+                df['Date'] = pd.to_datetime(df['Date'])
+                # Set as index if not already
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.set_index('Date', inplace=True)
+            else:
+                # If index is numeric and we don't have a Date column,
+                # the file format might be incompatible
+                print("Warning: No 'Date' column found in the CSV file")
+                return None
 
-        # Apply date filters if provided
-        if start_date:
-            start_date = pd.to_datetime(start_date)
-            df = df[df.index >= start_date]
+            # Apply date filters if provided
+            if start_date:
+                start_date = pd.to_datetime(start_date)
+                df = df[df.index >= start_date]
 
-        if end_date:
-            end_date = pd.to_datetime(end_date)
-            df = df[df.index <= end_date]
+            if end_date:
+                end_date = pd.to_datetime(end_date)
+                df = df[df.index <= end_date]
 
-        return df
+            print(f"Successfully loaded {len(df)} rows of data")
+            print(f"Date range: {df.index.min()} to {df.index.max()}")
+
+            return df
+
+        except Exception as e:
+            print(f"Error loading data from {file_path}: {e}")
+            print("Try running download_yahoo.py to fetch fresh data.")
+            return None
+
+    def save_data(self, df, symbol, start_date, end_date):
+        """Save data to a CSV file"""
+        if df is None or df.empty:
+            print("No data to save")
+            return None
+
+        # Format filename
+        start_str = start_date
+        end_str = end_date
+
+        if isinstance(start_date, datetime.datetime):
+            start_str = start_date.strftime("%Y-%m-%d")
+        if isinstance(end_date, datetime.datetime):
+            end_str = end_date.strftime("%Y-%m-%d")
+
+        filename = f"{symbol}_{start_str}_{end_str}.csv"
+        file_path = os.path.join(self.data_dir, filename)
+
+        # Save to CSV
+        df.to_csv(file_path)
+        print(f"Data saved to: {file_path}")
+
+        return file_path
 
 
 class BacktraderFeeder:
@@ -108,10 +275,10 @@ class BacktraderFeeder:
         self.data_fetcher = data_fetcher or CSVDataFetcher()
         self.cerebro = bt.Cerebro()
 
-    def add_data(self, symbol, start_date=None, end_date=None, years=None):
+    def add_data(self, symbol, start_date=None, end_date=None):
         """Add data for a symbol to Backtrader"""
         # Get the data as DataFrame
-        df = self.data_fetcher.get_data(symbol, start_date, end_date, years)
+        df = self.data_fetcher.get_data(symbol, start_date, end_date)
 
         if df is None or df.empty:
             print(f"No data available for {symbol}")
@@ -200,26 +367,38 @@ def print_backtrader_info(cerebro):
 
 
 if __name__ == "__main__":
-    # Test the CSVDataFetcher
+    # Test both the CSVDataFetcher and YahooFinanceDataFetcher
     symbol = "AAPL"
-    years = 3
+    start_date = "2019-01-01"
+    end_date = "2022-12-31"
 
-    print(f"Testing CSVDataFetcher with {symbol} for {years} years")
+    print(f"Testing data fetchers with {symbol} from {start_date} to {end_date}")
 
-    # Create data fetcher and load data into pandas DataFrame
+    # First try YahooFinanceDataFetcher to get fresh data
+    print("\n1. Testing YahooFinanceDataFetcher:")
+    yahoo_fetcher = YahooFinanceDataFetcher()
+    df_yahoo = yahoo_fetcher.get_data(symbol, start_date=start_date, end_date=end_date)
+
+    if df_yahoo is not None and not df_yahoo.empty:
+        print_dataframe_info(df_yahoo, f"{symbol} (Yahoo Finance)")
+    else:
+        print(f"Could not fetch {symbol} data from Yahoo Finance")
+
+    # Then test CSVDataFetcher to load from saved data
+    print("\n2. Testing CSVDataFetcher:")
     csv_fetcher = CSVDataFetcher()
-    df = csv_fetcher.get_data(symbol, years=years)
+    df_csv = csv_fetcher.get_data(symbol, start_date=start_date, end_date=end_date)
 
-    if df is not None and not df.empty:
+    if df_csv is not None and not df_csv.empty:
         # Print information about the DataFrame
-        print_dataframe_info(df, symbol)
+        print_dataframe_info(df_csv, f"{symbol} (CSV)")
 
         # Test loading into Backtrader
         print(f"\nLoading {symbol} data into Backtrader")
         bt_feeder = BacktraderFeeder(csv_fetcher)
 
         # Add data and run
-        if bt_feeder.add_data(symbol, years=years):
+        if bt_feeder.add_data(symbol, start_date=start_date, end_date=end_date):
             results = bt_feeder.run()
 
             # Print Backtrader data information
@@ -229,4 +408,4 @@ if __name__ == "__main__":
         else:
             print(f"Failed to add {symbol} data to Backtrader")
     else:
-        print(f"No data found for {symbol}")
+        print(f"No CSV data found for {symbol}")

@@ -26,16 +26,18 @@ from indicators import TechnicalIndicators
 class BoostModel:
     """XGBoost-based model for stock price prediction using 3-class classification (Sell/Hold/Buy)"""
 
-    def __init__(self, symbol='AAPL', years=3):
+    def __init__(self, symbol='AAPL', start_date=None, end_date=None):
         """
         Initialize the model
 
         Args:
             symbol (str): Stock symbol to train on
-            years (int): Number of years of data to use
+            start_date (str or datetime, optional): Start date
+            end_date (str or datetime, optional): End date
         """
         self.symbol = symbol
-        self.years = years
+        self.start_date = start_date
+        self.end_date = end_date
         self.model = None
         self.indicators = TechnicalIndicators()
 
@@ -55,7 +57,7 @@ class BoostModel:
 
         # Load data
         print(f"Loading data for {self.symbol}...")
-        df = data_fetcher.get_data(self.symbol, years=self.years)
+        df = data_fetcher.get_data(self.symbol, start_date=self.start_date, end_date=self.end_date)
 
         if df is None or df.empty:
             print(f"Error: Could not load data for {self.symbol}")
@@ -68,6 +70,19 @@ class BoostModel:
         # Print summary info
         print(f"Loaded data with shape: {df.shape}")
         print(f"Date range: {df.index.min()} to {df.index.max()}")
+
+        # Check that raw OHLCV columns have been properly replaced with normalized versions
+        raw_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        norm_columns = [col for col in df.columns if col.startswith('norm_')]
+
+        if any(col in df.columns for col in raw_columns):
+            print("\nWARNING: Some raw price/volume columns remain in the dataset.")
+            remaining_raw = [col for col in raw_columns if col in df.columns]
+            print(f"Raw columns present: {remaining_raw}")
+        else:
+            print("\nUsing only normalized features for model training.")
+            print(f"Normalized features include: {', '.join(norm_columns[:5])}...")
+            print(f"Total normalized features: {len(norm_columns)}")
 
         return df
 
@@ -148,7 +163,7 @@ class BoostModel:
                 print(f"  {class_name} ({i}): mean={class_returns.mean():.2f}%, min={class_returns.min():.2f}%, max={class_returns.max():.2f}%")
 
         # Drop temporary columns
-        result = result.drop(['avg_return_5', 'fwd_return'], axis=1)
+        result = result.drop(['fwd_return'], axis=1)
         return result
 
     def split_data(self, df, train_size=0.6, val_size=0.2):
@@ -186,7 +201,27 @@ class BoostModel:
         test_df = df.iloc[val_end:]
 
         # Prepare feature columns (excluding labels and other non-feature columns)
-        feature_cols = [col for col in df.columns if col not in ['label', 'signal', 'position', 'market_return', 'strategy_return', 'cum_market_return', 'cum_strategy_return']]
+        # This expanded list now explicitly excludes original raw columns from Yahoo Finance
+        excluded_columns = [
+            'label', 'signal', 'position', 'market_return',
+            'strategy_return', 'cum_market_return', 'cum_strategy_return',
+            'avg_return_5',
+            # Original price and volume columns (excludes normalized versions)
+            'Open', 'High', 'Low', 'Close', 'Volume',
+            # These columns might be present in some data sources
+            'Adj Close', 'Dividends', 'Stock Splits', 'Date'
+        ]
+
+        feature_cols = [col for col in df.columns if col not in excluded_columns]
+
+        # Print the feature columns being used for training
+        print(f"\nUsing {len(feature_cols)} features for model training")
+        print(f"Sample features: {', '.join(feature_cols[:5])}...")
+
+        if len(feature_cols) > 30:
+            print(f"Total number of features: {len(feature_cols)}")
+        else:
+            print(f"All features: {', '.join(feature_cols)}")
 
         # Create X and y for each set
         X_train = train_df[feature_cols]
@@ -293,14 +328,14 @@ class BoostModel:
         print(f"Imbalance ratio: {imbalance_ratio:.2f}:1")
 
         # Use a more even class weighting approach with power scaling
-        print("Using aggressive balancing for Sell and Buy classes")
+        print("Using moderate balancing for Sell and Buy classes")
 
-        # Set explicit weights to strongly favor Sell and Buy classes
+        # Set explicit weights to moderately favor Sell and Buy classes
         # Sell = 0, Hold = 1, Buy = 2
         class_weights = {
-            0: 2.0,  # Strong boost for Sell class
-            1: 0.5,  # Reduce weight for Hold class
-            2: 2.0   # Strong boost for Buy class
+            0: 1.5,  # Moderate boost for Sell class
+            1: 0.5,  # Slightly reduce weight for Hold class
+            2: 1.5   # Moderate boost for Buy class
         }
 
         # Make sure all classes have weights
@@ -308,7 +343,7 @@ class BoostModel:
             if class_idx not in class_weights:
                 class_weights[class_idx] = 1.0
 
-        print(f"Applied strong boosting to Sell and Buy classes, reduced Hold class weight")
+        print(f"Applied moderate boosting to Sell and Buy classes, slightly reduced Hold class weight")
 
         # Normalize weights so they sum to number of classes
         weight_sum = sum(class_weights.values())
@@ -465,6 +500,37 @@ class BoostModel:
         for feature, score in top_features:
             print(f"  {feature}: {score}")
 
+        # Analyze normalized feature importance
+        norm_features = [f for f in importance.keys() if f.startswith('norm_')]
+        minmax_features = [f for f in importance.keys() if f.startswith('minmax_')]
+
+        if norm_features:
+            print("\nImportance of Z-score normalized features:")
+            norm_importance = [(f, importance[f]) for f in norm_features]
+            norm_importance.sort(key=lambda x: x[1], reverse=True)
+            for feature, score in norm_importance[:5]:  # Top 5 normalized features
+                print(f"  {feature}: {score}")
+
+        if minmax_features:
+            print("\nImportance of min-max normalized features:")
+            minmax_importance = [(f, importance[f]) for f in minmax_features]
+            minmax_importance.sort(key=lambda x: x[1], reverse=True)
+            for feature, score in minmax_importance[:5]:  # Top 5 min-max features
+                print(f"  {feature}: {score}")
+
+        # Calculate percentage of importance from normalized features
+        total_importance = sum(importance.values())
+        norm_importance_sum = sum(importance[f] for f in norm_features)
+        minmax_importance_sum = sum(importance[f] for f in minmax_features)
+
+        norm_pct = (norm_importance_sum / total_importance) * 100 if total_importance > 0 else 0
+        minmax_pct = (minmax_importance_sum / total_importance) * 100 if total_importance > 0 else 0
+
+        print(f"\nNormalized feature importance distribution:")
+        print(f"  Z-score normalized features: {norm_pct:.2f}% of total importance")
+        print(f"  Min-max normalized features: {minmax_pct:.2f}% of total importance")
+        print(f"  Other features: {100 - norm_pct - minmax_pct:.2f}% of total importance")
+
         # Test the model's prediction distribution on training data
         dtrain_pred = xgb.DMatrix(X_train)
         y_train_pred_proba = self.model.predict(dtrain_pred)
@@ -488,18 +554,8 @@ class BoostModel:
             class_name = ['Sell', 'Hold', 'Buy'][i]
             print(f"  {class_name} ({i}): {count} samples ({pct:.2f}%)")
 
-        # Check if we're not predicting the Buy class
-        if train_pred_counts[2] == 0:
-            print("\nWARNING: Model is not predicting Buy class on training data")
-            # Check probability distribution for Buy class
-            buy_indices = np.where(y_train.values == 2)[0]
-            if len(buy_indices) > 0:
-                buy_probs = y_train_pred_proba[buy_indices, 2]
-                print(f"Average Buy class probability: {np.mean(buy_probs):.4f}")
-                print(f"Max Buy class probability: {np.max(buy_probs):.4f}")
-                print(f"Samples where Buy probability > 0.2: {np.sum(buy_probs > 0.2)}")
-
         return self.model
+
 
     def validate(self, X_val, y_val):
         """
@@ -521,9 +577,16 @@ class BoostModel:
         print(f"\nValidation labels distribution check:")
         print(f"Unique labels: {unique_labels}")
         value_counts = y_val.value_counts().sort_index()
+        # Store class counts for later use
+        class_counts = value_counts
         for label, count in value_counts.items():
             class_name = ['Sell', 'Hold', 'Buy'][label]
             print(f"  {class_name} ({label}): {count} samples ({count/len(y_val)*100:.2f}%)")
+
+        # Calculate imbalance ratio
+        if len(class_counts) > 1 and class_counts.min() > 0:
+            imbalance_ratio = class_counts.max() / class_counts.min()
+            print(f"Imbalance ratio: {imbalance_ratio:.2f}:1")
 
         # Create DMatrix for prediction
         dval = xgb.DMatrix(X_val)
@@ -539,33 +602,288 @@ class BoostModel:
         # Get the predicted class (0, 1, or 2 for sell, hold, buy)
         y_pred = np.argmax(y_pred_proba, axis=1)
 
-        # Check distribution of predictions
-        pred_unique = np.unique(y_pred)
-        print(f"Unique predictions: {pred_unique}")
-        for label in range(3):
-            class_name = ['Sell', 'Hold', 'Buy'][label]
-            count = np.sum(y_pred == label)
-            print(f"  Predicted {class_name} ({label}): {count} samples ({count/len(y_pred)*100:.2f}%)")
+        # Apply margin-based prediction override
+        # When the margin between highest probability and second highest probability is small,
+        # we override to Hold class (1) since we're not confident enough in the prediction
+        margin_threshold = 0.15  # Minimum confidence margin required
 
-        # Get classification report with the labels
+        # Get the original predictions for comparison
+        original_pred = y_pred.copy()
+
+        # For each prediction, calculate the margin between top and second probabilities
+        margins = []
+        for i in range(len(y_pred_proba)):
+            # Sort probabilities in descending order
+            sorted_probs = np.sort(y_pred_proba[i])[::-1]
+            # Margin is difference between highest and second highest probability
+            margin = sorted_probs[0] - sorted_probs[1]
+            margins.append(margin)
+
+            # If margin is below threshold and prediction is not already Hold,
+            # override to Hold class
+            if margin < margin_threshold and y_pred[i] != 1:
+                y_pred[i] = 1  # Override to Hold
+
+        # Calculate how many predictions were overridden
+        overrides = np.sum(y_pred != original_pred)
+        override_pct = (overrides / len(y_pred)) * 100
+
+        print(f"\nMargin-based prediction overrides:")
+        print(f"  Threshold: {margin_threshold}")
+        print(f"  Predictions overridden: {overrides} ({override_pct:.2f}%)")
+        print(f"  Average margin: {np.mean(margins):.4f}")
+
+        # Show distribution of overridden predictions
+        if overrides > 0:
+            override_indices = np.where(y_pred != original_pred)[0]
+            original_classes = original_pred[override_indices]
+            override_counts = np.bincount(original_classes, minlength=3)
+            print("\nOverridden prediction distribution:")
+            for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
+                count = override_counts[i]
+                percent = count / overrides * 100 if overrides > 0 else 0
+                print(f"  {class_name} ({i}) → Hold: {count} predictions ({percent:.2f}%)")
+
+        # Check predicted class distribution
+        pred_counts = np.bincount(y_pred, minlength=3)
+        print("\nPredicted class distribution (after margin override):")
+        for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
+            count = pred_counts[i]
+            percent = count / len(y_pred) * 100
+            print(f"  {class_name} ({i}): {count} samples ({percent:.2f}%)")
+
+        # Compare actual vs predicted distributions
+        print("\nActual vs Predicted class distribution:")
+        actual_dist = np.bincount(y_val.astype(int), minlength=3) / len(y_val)
+        pred_dist = pred_counts / len(y_pred)
+
+        for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
+            actual_pct = actual_dist[i] * 100
+            pred_pct = pred_dist[i] * 100
+            diff = pred_pct - actual_pct
+            print(f"  {class_name} ({i}): Actual {actual_pct:.2f}%, Predicted {pred_pct:.2f}%, Diff {diff:+.2f}%")
+
+        # Check for any missing class predictions
+        missing_preds = set(range(3)) - set(np.unique(y_pred))
+        if missing_preds:
+            print(f"\nWARNING: Some classes are never predicted: {[['Sell', 'Hold', 'Buy'][i] for i in missing_preds]}")
+
+            # For each missing class, analyze why it might not be predicted
+            for missing_class in missing_preds:
+                class_name = ['Sell', 'Hold', 'Buy'][missing_class]
+                # Find samples that should belong to this class
+                true_samples = np.where(y_val == missing_class)[0]
+                if len(true_samples) > 0:
+                    # Get their probabilities
+                    true_probs = y_pred_proba[true_samples]
+                    # Get the probability assigned to the correct class
+                    correct_probs = true_probs[:, missing_class]
+                    # Get the class that was predicted instead
+                    pred_classes = y_pred[true_samples]
+
+                    print(f"\nAnalysis of {len(true_samples)} true {class_name} samples:")
+                    predicted_counts = np.bincount(pred_classes, minlength=3)
+                    for i, name in enumerate(['Sell', 'Hold', 'Buy']):
+                        if i != missing_class and predicted_counts[i] > 0:
+                            print(f"  Predicted as {name} ({i}): {predicted_counts[i]} samples")
+
+                    print(f"  Average probability for {class_name}: {np.mean(correct_probs):.4f}")
+                    print(f"  Max probability for {class_name}: {np.max(correct_probs):.4f}")
+
+                    # Calculate how close these samples were to being correctly classified
+                    winning_probs = np.array([true_probs[j, pred_classes[j]] for j in range(len(true_samples))])
+                    margins = winning_probs - correct_probs
+                    print(f"  Average margin to correct prediction: {np.mean(margins):.4f}")
+                    close_calls = np.sum(margins < 0.05)
+                    print(f"  Samples within 0.05 of being correctly predicted: {close_calls} ({close_calls/len(true_samples)*100:.2f}%)")
+                else:
+                    print(f"\nNo true {class_name} samples in validation set to analyze.")
+
+        # Print detailed classification report
         print("\nValidation Results:")
         print(classification_report(y_val, y_pred,
                                   target_names=['Sell (0)', 'Hold (1)', 'Buy (2)'],
                                   zero_division=0))
 
-        # Get metrics
+        # Print confusion matrix
+        print("\nConfusion Matrix:")
+        cm = confusion_matrix(y_val, y_pred)
+        print(f"               Predicted")
+        print(f"               Sell(0) Hold(1) Buy(2)")
+        print(f"Actual Sell(0) {cm[0,0]:6d} {cm[0,1]:6d} {cm[0,2]:6d}")
+        print(f"      Hold(1) {cm[1,0]:6d} {cm[1,1]:6d} {cm[1,2]:6d}")
+        print(f"      Buy(2)  {cm[2,0]:6d} {cm[2,1]:6d} {cm[2,2]:6d}")
+
+        # Try to visualize the confusion matrix
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(10, 8))
+
+            # Plot confusion matrix as a heatmap
+            sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                       xticklabels=['Sell', 'Hold', 'Buy'],
+                       yticklabels=['Sell', 'Hold', 'Buy'])
+            plt.xlabel('Predicted')
+            plt.ylabel('Actual')
+            plt.title('Confusion Matrix')
+
+            # Save the plot
+            plt.savefig('confusion_matrix.png')
+            print("Saved confusion matrix visualization to 'confusion_matrix.png'")
+        except Exception as e:
+            print(f"Could not create confusion matrix visualization: {e}")
+
+        # Calculate per-class accuracy
+        class_accuracy = np.zeros(3)
+        for i in range(3):
+            if i in np.unique(y_val) and np.sum(y_val == i) > 0:
+                class_accuracy[i] = cm[i,i] / np.sum(cm[i,:]) if np.sum(cm[i,:]) > 0 else 0
+            else:
+                class_accuracy[i] = np.nan  # Use NaN for classes with no samples
+
+        print("\nPer-class accuracy:")
+        for i, acc in enumerate(class_accuracy):
+            class_name = ['Sell', 'Hold', 'Buy'][i]
+            if not np.isnan(acc):
+                print(f"  {class_name} ({i}): {acc:.4f}")
+            else:
+                print(f"  {class_name} ({i}): N/A (no samples)")
+
+        # Detailed analysis of minority classes
+        print("\nDetailed analysis of minority classes:")
+
+        # Sell class (0) analysis
+        sell_indices = np.where(y_val == 0)[0]
+        if len(sell_indices) > 0:
+            sell_preds = y_pred[sell_indices]
+            sell_acc = np.mean(sell_preds == 0)
+            sell_confusion = np.bincount(sell_preds, minlength=3)
+            print(f"  Sell class ({len(sell_indices)} samples):")
+            print(f"    Accuracy: {sell_acc:.4f}")
+            print(f"    Predicted as: Sell: {sell_confusion[0]} ({sell_confusion[0]/len(sell_indices)*100:.1f}%), " +
+                  f"Hold: {sell_confusion[1]} ({sell_confusion[1]/len(sell_indices)*100:.1f}%), " +
+                  f"Buy: {sell_confusion[2]} ({sell_confusion[2]/len(sell_indices)*100:.1f}%)")
+
+            # Analysis of probabilities for Sell class
+            sell_probs = y_pred_proba[sell_indices]
+            avg_probs = np.mean(sell_probs, axis=0)
+            print(f"    Average probabilities: Sell: {avg_probs[0]:.4f}, Hold: {avg_probs[1]:.4f}, Buy: {avg_probs[2]:.4f}")
+            print(f"    Probability margin: {avg_probs[0] - np.max(avg_probs[1:]):.4f}")
+
+        # Buy class (2) analysis
+        buy_indices = np.where(y_val == 2)[0]
+        if len(buy_indices) > 0:
+            buy_preds = y_pred[buy_indices]
+            buy_acc = np.mean(buy_preds == 2)
+            buy_confusion = np.bincount(buy_preds, minlength=3)
+            print(f"  Buy class ({len(buy_indices)} samples):")
+            print(f"    Accuracy: {buy_acc:.4f}")
+            print(f"    Predicted as: Sell: {buy_confusion[0]} ({buy_confusion[0]/len(buy_indices)*100:.1f}%), " +
+                  f"Hold: {buy_confusion[1]} ({buy_confusion[1]/len(buy_indices)*100:.1f}%), " +
+                  f"Buy: {buy_confusion[2]} ({buy_confusion[2]/len(buy_indices)*100:.1f}%)")
+
+            # Analysis of probabilities for Buy class
+            buy_probs = y_pred_proba[buy_indices]
+            avg_probs = np.mean(buy_probs, axis=0)
+            print(f"    Average probabilities: Sell: {avg_probs[0]:.4f}, Hold: {avg_probs[1]:.4f}, Buy: {avg_probs[2]:.4f}")
+            print(f"    Probability margin: {avg_probs[2] - np.max(avg_probs[:2]):.4f}")
+
+        # Calculate balanced accuracy (average of per-class accuracies)
+        valid_accuracies = class_accuracy[~np.isnan(class_accuracy)]
+        balanced_acc = np.mean(valid_accuracies) if len(valid_accuracies) > 0 else 0
+        print(f"Balanced accuracy (mean of per-class accuracies): {balanced_acc:.4f}")
+
+        # Calculate metrics
         metrics = {}
 
-        # For multi-class, use weighted metrics
+        # Accuracy
         metrics['accuracy'] = accuracy_score(y_val, y_pred)
+
+        # Use weighted metrics for multi-class
         metrics['precision'] = precision_score(y_val, y_pred, average='weighted', zero_division=0)
         metrics['recall'] = recall_score(y_val, y_pred, average='weighted', zero_division=0)
         metrics['f1'] = f1_score(y_val, y_pred, average='weighted', zero_division=0)
 
-        # Also add macro-averaged metrics
+        # Add macro-averaged metrics
         metrics['precision_macro'] = precision_score(y_val, y_pred, average='macro', zero_division=0)
         metrics['recall_macro'] = recall_score(y_val, y_pred, average='macro', zero_division=0)
         metrics['f1_macro'] = f1_score(y_val, y_pred, average='macro', zero_division=0)
+
+        # Add per-class metrics
+        for i, acc in enumerate(class_accuracy):
+            class_name = ['Sell', 'Hold', 'Buy'][i]
+            if not np.isnan(acc):
+                metrics[f'accuracy_{class_name}'] = acc
+
+        metrics['balanced_accuracy'] = balanced_acc
+
+        # Calculate performance on minority classes specifically
+        minority_classes = []
+        for i in range(3):
+            if i in class_counts.index and class_counts[i] < len(y_val) / 6:  # Less than 1/6 of data
+                minority_classes.append(i)
+
+        if minority_classes:
+            print(f"\nMinority class performance (classes {[['Sell', 'Hold', 'Buy'][i] for i in minority_classes]}):")
+            # Calculate metrics just for minority classes
+            minority_indices = np.isin(y_val, minority_classes)
+            if np.any(minority_indices):
+                minority_y_true = y_val[minority_indices]
+                minority_y_pred = y_pred[minority_indices]
+
+                try:
+                    minority_acc = accuracy_score(minority_y_true, minority_y_pred)
+                    minority_recall = recall_score(minority_y_true, minority_y_pred, average='macro', zero_division=0)
+                    print(f"  Accuracy: {minority_acc:.4f}")
+                    print(f"  Recall: {minority_recall:.4f}")
+
+                    metrics['minority_accuracy'] = minority_acc
+                    metrics['minority_recall'] = minority_recall
+                except Exception as e:
+                    print(f"  Could not calculate minority metrics: {e}")
+
+        # Baseline comparison
+        # For multi-class: always predict mode
+        if not class_counts.empty:
+            majority_class = class_counts.idxmax()
+            baseline_accuracy = (y_val == majority_class).mean()
+
+            # Map the majority class to its label
+            majority_class_name = ['Sell', 'Hold', 'Buy'][majority_class]
+            print(f"\nBaseline Accuracy (always predict {majority_class_name}({majority_class})): {baseline_accuracy:.4f}")
+            print(f"Model improvement over baseline: {(metrics['accuracy'] - baseline_accuracy) * 100:.2f}%")
+
+            # For balanced accuracy, the baseline would be 1/n_classes if classes are balanced
+            n_valid_classes = sum(1 for c in np.unique(y_val))
+            balanced_baseline = 1/n_valid_classes if n_valid_classes > 0 else 0
+            print(f"Balanced accuracy baseline (random guessing): {balanced_baseline:.4f}")
+            print(f"Balanced accuracy improvement: {(balanced_acc - balanced_baseline) * 100:.2f}%")
+
+            metrics['baseline_accuracy'] = baseline_accuracy
+            metrics['balanced_baseline'] = balanced_baseline
+
+        # Summary of model performance
+        print("\nPerformance Summary:")
+        print(f"  Overall Accuracy: {metrics['accuracy']:.4f}")
+        print(f"  Balanced Accuracy: {metrics['balanced_accuracy']:.4f}")
+        print(f"  Macro-averaged F1: {metrics['f1_macro']:.4f}")
+
+        # Give an overall assessment
+        if metrics['balanced_accuracy'] > 0.5:
+            print("\nThe model shows meaningful predictive power across all classes.")
+        elif metrics['balanced_accuracy'] > 0.33:
+            print("\nThe model performs better than random guessing, but still struggles with some classes.")
+        else:
+            print("\nThe model is not effectively learning patterns for all classes.")
+
+        # Provide improvement suggestions
+        print("\nPossible improvements:")
+        if 'imbalance_ratio' in locals() and imbalance_ratio > 5:
+            print("1. Rebalance classes using different thresholds or sampling techniques")
+        if metrics['balanced_accuracy'] < 0.4:
+            print("2. Explore different features or feature engineering")
+        if np.any(class_accuracy < 0.2) and not np.all(np.isnan(class_accuracy)):
+            print("3. Investigate specific features that might better predict struggling classes")
 
         return metrics
 
@@ -645,9 +963,51 @@ class BoostModel:
         # Get the predicted class (0, 1, or 2 for sell, hold, buy)
         y_pred = np.argmax(y_pred_proba, axis=1)
 
+        # Apply margin-based prediction override
+        # When the margin between highest probability and second highest probability is small,
+        # we override to Hold class (1) since we're not confident enough in the prediction
+        margin_threshold = 0.12  # Minimum confidence margin required
+
+        # Get the original predictions for comparison
+        original_pred = y_pred.copy()
+
+        # For each prediction, calculate the margin between top and second probabilities
+        margins = []
+        for i in range(len(y_pred_proba)):
+            # Sort probabilities in descending order
+            sorted_probs = np.sort(y_pred_proba[i])[::-1]
+            # Margin is difference between highest and second highest probability
+            margin = sorted_probs[0] - sorted_probs[1]
+            margins.append(margin)
+
+            # If margin is below threshold and prediction is not already Hold,
+            # override to Hold class
+            if margin < margin_threshold and y_pred[i] != 1:
+                y_pred[i] = 1  # Override to Hold
+
+        # Calculate how many predictions were overridden
+        overrides = np.sum(y_pred != original_pred)
+        override_pct = (overrides / len(y_pred)) * 100
+
+        print(f"\nMargin-based prediction overrides:")
+        print(f"  Threshold: {margin_threshold}")
+        print(f"  Predictions overridden: {overrides} ({override_pct:.2f}%)")
+        print(f"  Average margin: {np.mean(margins):.4f}")
+
+        # Show distribution of overridden predictions
+        if overrides > 0:
+            override_indices = np.where(y_pred != original_pred)[0]
+            original_classes = original_pred[override_indices]
+            override_counts = np.bincount(original_classes, minlength=3)
+            print("\nOverridden prediction distribution:")
+            for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
+                count = override_counts[i]
+                percent = count / overrides * 100 if overrides > 0 else 0
+                print(f"  {class_name} ({i}) → Hold: {count} predictions ({percent:.2f}%)")
+
         # Check predicted class distribution
         pred_counts = np.bincount(y_pred, minlength=3)
-        print("\nPredicted class distribution:")
+        print("\nPredicted class distribution (after margin override):")
         for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
             count = pred_counts[i]
             percent = count / len(y_pred) * 100
@@ -750,7 +1110,7 @@ class BoostModel:
             else:
                 print(f"  {class_name} ({i}): N/A (no samples)")
 
-        # Detailed analysis of Sell and Buy classes
+        # Detailed analysis of minority classes
         print("\nDetailed analysis of minority classes:")
 
         # Sell class (0) analysis
@@ -829,12 +1189,12 @@ class BoostModel:
             # Calculate metrics just for minority classes
             minority_indices = np.isin(y_test, minority_classes)
             if np.any(minority_indices):
-                minority_y_test = y_test[minority_indices]
+                minority_y_true = y_test[minority_indices]
                 minority_y_pred = y_pred[minority_indices]
 
                 try:
-                    minority_acc = accuracy_score(minority_y_test, minority_y_pred)
-                    minority_recall = recall_score(minority_y_test, minority_y_pred, average='macro', zero_division=0)
+                    minority_acc = accuracy_score(minority_y_true, minority_y_pred)
+                    minority_recall = recall_score(minority_y_true, minority_y_pred, average='macro', zero_division=0)
                     print(f"  Accuracy: {minority_acc:.4f}")
                     print(f"  Recall: {minority_recall:.4f}")
 
@@ -979,13 +1339,19 @@ if __name__ == "__main__":
 
     # Parse command line arguments
     import argparse
-    parser = argparse.ArgumentParser(description='XGBoost Stock Price Movement Model')
+    parser = argparse.ArgumentParser(description='XGBoost Stock Price Movement Model with Normalized Features')
     parser.add_argument('--symbol', type=str, default='AAPL', help='Stock symbol')
-    parser.add_argument('--years', type=int, default=3, help='Years of data to use')
+    parser.add_argument('--start_date', type=str, default='2019-01-01', help='Start date (YYYY-MM-DD)')
+    parser.add_argument('--end_date', type=str, default='2024-12-31', help='End date (YYYY-MM-DD)')
+    parser.add_argument('--normalize_only', action='store_true', help='Use only normalized features (exclude raw data)')
     args = parser.parse_args()
 
+    print(f"Running model with normalized features for {args.symbol}")
+    print(f"Data range: {args.start_date} to {args.end_date}")
+    print("Model will use only normalized features, excluding raw OHLCV data")
+
     # Create model instance
-    model = BoostModel(symbol=args.symbol, years=args.years)
+    model = BoostModel(symbol=args.symbol, start_date=args.start_date, end_date=args.end_date)
 
     # Load data
     df = model.load_data()
@@ -1007,11 +1373,12 @@ if __name__ == "__main__":
                 count = (y == val).sum()
                 print(f"  Label {class_name} ({val}): {count} samples ({count/len(y)*100:.2f}%)")
 
-        print("\nFeatures used for training:")
-        print(f"Number of features: {X_train.shape[1]}")
-        print(f"Sample features: {', '.join(X_train.columns[:5])}")
+        # Check that we're using normalized features
+        norm_features = [col for col in X_train.columns if col.startswith('norm_') or col.startswith('minmax_')]
+        print(f"\nTraining with {len(norm_features)} normalized features out of {X_train.shape[1]} total features")
+        print(f"Normalized feature sample: {', '.join(norm_features[:5])}...")
 
-        # Train the model with default parameters
+        # Train the model
         model.train(X_train, y_train, X_val, y_val)
 
         # Get feature importance for analysis
@@ -1019,6 +1386,16 @@ if __name__ == "__main__":
         if importance_df is not None:
             print("\nTop 10 Most Important Features:")
             print(importance_df.head(10)[['Feature', 'Relative Importance (%)', 'Cumulative Importance (%)']])
+
+            # Check importance of normalized features
+            norm_importance = importance_df[importance_df['Feature'].str.startswith(('norm_', 'minmax_'))]
+            if not norm_importance.empty:
+                print("\nTop 5 Most Important Normalized Features:")
+                print(norm_importance.head(5)[['Feature', 'Relative Importance (%)']])
+
+                # Calculate total importance of normalized features
+                norm_importance_pct = norm_importance['Relative Importance (%)'].sum()
+                print(f"Normalized features account for {norm_importance_pct:.2f}% of total feature importance")
 
         # Validate the model
         val_metrics = model.validate(X_val, y_val)
@@ -1041,3 +1418,6 @@ if __name__ == "__main__":
                 print(f"  {class_name} Accuracy: {test_metrics[f'accuracy_{class_name}']:.4f}")
 
         print("\nModel training and evaluation completed successfully!")
+        print("Used normalized features instead of raw OHLCV data")
+    else:
+        print(f"Failed to load data for {args.symbol}. Please check data availability.")
