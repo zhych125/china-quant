@@ -73,7 +73,7 @@ class BoostModel:
 
     def create_labels(self, df):
         """
-        Create labels for the dataset based on next-day price movement
+        Create labels for the dataset based on average return over next 5 days
         Using 3-class classification (Sell/Hold/Buy)
 
         Args:
@@ -85,21 +85,23 @@ class BoostModel:
         # Create a copy to avoid modifying the original
         result = df.copy()
 
-        # Calculate percentage return for next day
-        result['next_close'] = result['Close'].shift(-1)
-        result['pct_return'] = (result['next_close'] - result['Close']) / result['Close'] * 100
+        result['fwd_return'] = result['Close'].shift(-1) / result['Close'] - 1
+        result['avg_return_5'] = result['fwd_return'].shift(-1).rolling(window=5).mean() * 100
 
-        # Use more separated thresholds for class separation
-        # Use -1% and +1% as thresholds for clearer separation between classes
-        print("\nUsing thresholds for class separation:")
-        print("  Sell (0): return < -1%")
-        print("  Hold (1): -1% <= return <= 1%")
-        print("  Buy (2): return > 1%")
+        # Drop rows with NaN values in avg_return_5
+        result = result.dropna(subset=['avg_return_5'])
+        print(f"Dropped {len(df) - len(result)} rows with NaN values in avg_return_5")
+
+        # Use thresholds for class separation
+        print("\nUsing thresholds for class separation based on 5-day average returns:")
+        print("  Sell (0): 5-day avg return < -0.5%")
+        print("  Hold (1): -0.5% <= 5-day avg return <= 0.5%")
+        print("  Buy (2): 5-day avg return > 0.5%")
 
         try:
             result['label'] = pd.cut(
-                result['pct_return'],
-                bins=[-np.inf, -1, 1, np.inf],
+                result['avg_return_5'],
+                bins=[-np.inf, -0.5, 0.5, np.inf],
                 labels=[0, 1, 2]
             )
             result['label'] = result['label'].astype(int)  # Convert from categorical to int
@@ -108,11 +110,9 @@ class BoostModel:
             # If there are issues, use a direct assignment approach
             print("Falling back to direct assignment approach")
             result['label'] = 1  # Default to hold (1)
-            result.loc[result['pct_return'] < -1, 'label'] = 0  # Sell when return < -1% (0)
-            result.loc[result['pct_return'] > 1, 'label'] = 2   # Buy when return > 1% (2)
+            result.loc[result['avg_return_5'] < -0.5, 'label'] = 0  # Sell when avg return < -0.5% (0)
+            result.loc[result['avg_return_5'] > 0.5, 'label'] = 2   # Buy when avg return > 0.5% (2)
 
-        # Drop the temporary columns but keep return_pct for diagnosis
-        result = result.drop(['next_close'], axis=1)
 
         # Drop rows with missing labels
         result = result.dropna(subset=['label'])
@@ -143,10 +143,12 @@ class BoostModel:
         # Analyze return distribution by class
         print("\nReturn distribution by class:")
         for i, class_name in enumerate(class_names):
-            class_returns = result.loc[result['label'] == i, 'pct_return']
+            class_returns = result.loc[result['label'] == i, 'avg_return_5']
             if len(class_returns) > 0:
                 print(f"  {class_name} ({i}): mean={class_returns.mean():.2f}%, min={class_returns.min():.2f}%, max={class_returns.max():.2f}%")
-        result = result.drop(['pct_return'], axis=1)
+
+        # Drop temporary columns
+        result = result.drop(['avg_return_5', 'fwd_return'], axis=1)
         return result
 
     def split_data(self, df, train_size=0.6, val_size=0.2):
@@ -278,8 +280,7 @@ class BoostModel:
 
         # Check if classes are balanced with the new thresholds
         class_percentages = (class_counts / total_samples * 100).to_dict()
-        print("\nClass distribution with -1/+1 thresholds:")
-        imbalance_detected = False
+        print("\nClass distribution with -0.5/+0.5 thresholds:")
         min_class = class_counts.min()
         max_class = class_counts.max()
         imbalance_ratio = max_class / min_class if min_class > 0 else float('inf')
@@ -291,22 +292,25 @@ class BoostModel:
 
         print(f"Imbalance ratio: {imbalance_ratio:.2f}:1")
 
-        # Use simple inverse frequency scaling for class weights
-        print("Using simple inverse frequency scaling for class weights")
+        # Use a more even class weighting approach with power scaling
+        print("Using aggressive balancing for Sell and Buy classes")
+
+        # Set explicit weights to strongly favor Sell and Buy classes
+        # Sell = 0, Hold = 1, Buy = 2
         class_weights = {
-            class_idx: total_samples / (len(class_counts) * count)
-            for class_idx, count in class_counts.items()
+            0: 2.0,  # Strong boost for Sell class
+            1: 0.5,  # Reduce weight for Hold class
+            2: 2.0   # Strong boost for Buy class
         }
 
-        # No boosting of minority classes
-        # Just ensure the majority class has a reasonable minimum weight
-        majority_class_idx = class_counts.idxmax()
-        min_weight_threshold = 0.75  # Minimum weight for majority class
-        if class_weights[majority_class_idx] < min_weight_threshold:
-            class_weights[majority_class_idx] = min_weight_threshold
-            print(f"Applied minimum weight threshold of {min_weight_threshold} to majority class {['Sell', 'Hold', 'Buy'][majority_class_idx]}")
+        # Make sure all classes have weights
+        for class_idx in class_counts.index:
+            if class_idx not in class_weights:
+                class_weights[class_idx] = 1.0
 
-        # Normalize weights to keep the same scale
+        print(f"Applied strong boosting to Sell and Buy classes, reduced Hold class weight")
+
+        # Normalize weights so they sum to number of classes
         weight_sum = sum(class_weights.values())
         class_weights = {k: v * len(class_weights) / weight_sum for k, v in class_weights.items()}
 
@@ -318,29 +322,31 @@ class BoostModel:
         # Convert class weights to sample weights for XGBoost
         sample_weights = y_train.map(class_weights)
 
-        # Set parameters for XGBoost with configuration focused on improving accuracy
-        # while still maintaining some regularization
+        # Set parameters for XGBoost with configuration focused on minority class performance
         params = {
-            'eta': 0.03,                  # Increased learning rate for faster convergence
-            'max_depth': 5,               # Deeper trees to capture more complex patterns
-            'subsample': 0.8,             # Less aggressive subsampling
-            'colsample_bytree': 0.8,      # Less aggressive column sampling
-            'colsample_bylevel': 0.8,     # Column sampling at each level
-            'min_child_weight': 2,        # Reduced to allow smaller leaf nodes
-            'alpha': 0.2,                 # Reduced L1 regularization
-            'lambda': 1.0,                # Standard L2 regularization
-            'gamma': 0.05,                # Reduced minimum loss reduction
-            'max_delta_step': 0,          # No limit on updates
+            'eta': 0.01,                  # Moderate learning rate
+            'max_depth': 3,               # Slightly reduced depth to prevent overfitting to majority class
+            'subsample': 0.7,            # More data points to avoid missing minority classes
+            'colsample_bytree': 0.7,     # More features per tree for better representation
+            'colsample_bylevel': 0.7,    # More features per level
+            'min_child_weight': 3,        # Reduced to allow smaller leaf nodes for minority classes
+            'alpha': 0.5,                 # Reduced L1 regularization
+            'lambda': 1.2,                # Reduced L2 regularization
+            'gamma': 0.2,                # Lower min loss reduction to capture more minority patterns
+            'max_delta_step': 2,          # Limit step size for more stable learning
+            'scale_pos_weight': 1,        # Handle class imbalance
             'tree_method': 'auto',
             'seed': 42,
             'objective': 'multi:softprob',
             'num_class': 3,
-            'eval_metric': ['mlogloss', 'merror']  # Track both log loss and classification error
+            'eval_metric': ['mlogloss', 'merror'],
+            # Class-specific penalties (favors Sell and Buy)
+            'base_score': 0.33,           # Equal initial probability for each class
         }
 
-        print("\nTraining parameters focused on improving accuracy:")
+        print("\nTraining parameters optimized for minority class performance:")
         for param, value in params.items():
-            if param not in ['tree_method', 'seed', 'objective', 'num_class', 'eval_metric']:
+            if param not in ['tree_method', 'seed', 'objective', 'num_class', 'eval_metric', 'base_score']:
                 print(f"  {param}: {value}")
 
         # Create DMatrix objects for XGBoost with sample weights
@@ -356,9 +362,10 @@ class BoostModel:
         class ClassDistributionCallback(xgb.callback.TrainingCallback):
             def __init__(self):
                 self.iter = 0
-                self.best_buy_pred_count = 0
-                self.best_model_iter = 0
                 self.best_model = None
+                self.best_score = float('inf')
+                self.best_model_iter = 0
+                self.target_distribution = {0: 0.25, 1: 0.50, 2: 0.25}  # Ideal class balance
 
             def after_iteration(self, model, epoch, evals_log):
                 # Only evaluate every 10 iterations to reduce output
@@ -367,17 +374,45 @@ class BoostModel:
                     y_pred_proba = model.predict(dval)
                     y_pred = np.argmax(y_pred_proba, axis=1)
 
-                    # Check if the model is predicting any of class 2 (Buy)
+                    # Calculate class distribution
                     class_counts = np.bincount(y_pred, minlength=3)
-                    buy_count = class_counts[2] if len(class_counts) > 2 else 0
+                    class_distribution = class_counts / len(y_pred)
 
-                    # Save model if it's predicting more Buy classes than before
-                    # This helps ensure we don't end up with a model that never predicts Buy
-                    if buy_count > self.best_buy_pred_count:
-                        self.best_buy_pred_count = buy_count
+                    # Calculate validation metrics
+                    val_accuracy = np.mean(y_pred == y_val)
+
+                    # Per-class accuracy (balanced metrics)
+                    class_accuracy = np.zeros(3)
+                    for i in range(3):
+                        true_positives = np.sum((y_val == i) & (y_pred == i))
+                        class_total = np.sum(y_val == i)
+                        class_accuracy[i] = true_positives / class_total if class_total > 0 else 0
+
+                    # Calculate balanced accuracy (average per-class accuracy)
+                    balanced_accuracy = np.mean(class_accuracy)
+
+                    # Penalize heavily if not predicting all classes
+                    all_classes_penalty = 1.0 if np.all(class_counts > 0) else 5.0
+
+                    # Calculate distribution similarity to target (lower is better)
+                    dist_error = 0
+                    for i in range(3):
+                        # Extra penalty for under-predicting Sell and Buy
+                        if i in [0, 2]:  # Sell or Buy
+                            dist_error += abs(class_distribution[i] - self.target_distribution[i]) * 2
+                        else:
+                            dist_error += abs(class_distribution[i] - self.target_distribution[i])
+
+                    # Combine metrics: prioritize balanced accuracy and distribution balance
+                    # Lower is better
+                    score = (1 - balanced_accuracy) * 3 + dist_error + all_classes_penalty * (1 - np.min(class_accuracy))
+
+                    # Save model if it's better
+                    if score < self.best_score:
+                        self.best_score = score
                         self.best_model_iter = self.iter
                         self.best_model = model.copy()
-                        print(f"Found better model for Buy class predictions (count: {buy_count})")
+                        print(f"Found better model at iteration {self.iter} (score: {score:.4f}, balanced acc: {balanced_accuracy:.4f})")
 
                     class_percentages = class_counts / len(y_pred) * 100
 
@@ -385,15 +420,17 @@ class BoostModel:
                     print(f"\n[Iteration {self.iter}] Class prediction distribution:")
                     for i, (count, pct) in enumerate(zip(class_counts, class_percentages)):
                         class_name = ['Sell', 'Hold', 'Buy'][i]
-                        print(f"  {class_name} ({i}): {count} samples ({pct:.2f}%)")
+                        acc = class_accuracy[i] * 100
+                        print(f"  {class_name} ({i}): {count} samples ({pct:.2f}%), accuracy: {acc:.2f}%")
+                    print(f"  Balanced accuracy: {balanced_accuracy:.4f}, Score: {score:.4f}")
 
                 self.iter += 1
                 return False  # Continue training
 
             def after_training(self, model):
-                # If we found a model that predicts Buy class, use it instead
-                if self.best_model is not None and self.best_buy_pred_count > 0:
-                    print(f"\nUsing best model from iteration {self.best_model_iter} with {self.best_buy_pred_count} Buy predictions")
+                # Always use the best model if found
+                if self.best_model is not None:
+                    print(f"\nUsing best model from iteration {self.best_model_iter} with score {self.best_score:.4f}")
                     return self.best_model
                 return model
 
@@ -404,15 +441,15 @@ class BoostModel:
             def before_iteration(self, model, epoch, evals_log):
                 return False
 
-        # Train model with more iterations for better accuracy
-        print("\nTraining XGBoost model with focus on prediction accuracy...")
+        # Train model with more iterations and patience
+        print("\nTraining XGBoost model with focus on balanced class performance...")
         callback = ClassDistributionCallback()
         self.model = xgb.train(
             params,
             dtrain,
-            num_boost_round=1000,         # Double iterations for more thorough learning
+            num_boost_round=1500,         # Increased iterations for thorough learning
             evals=evals,
-            early_stopping_rounds=80,     # More patience for convergence
+            early_stopping_rounds=100,    # More patience for convergence
             verbose_eval=10,              # Print every 10 rounds
             callbacks=[callback]
         )
@@ -550,7 +587,7 @@ class BoostModel:
 
         # Count samples by class
         class_counts = y_test.value_counts().sort_index()
-        print(f"\nTest set class distribution (-1.5/+1.5 thresholds):")
+        print(f"\nTest set class distribution (-0.5/+0.5 thresholds):")
         for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
             count = class_counts.get(i, 0)
             percent = count / len(y_test) * 100 if len(y_test) > 0 else 0
@@ -713,6 +750,45 @@ class BoostModel:
             else:
                 print(f"  {class_name} ({i}): N/A (no samples)")
 
+        # Detailed analysis of Sell and Buy classes
+        print("\nDetailed analysis of minority classes:")
+
+        # Sell class (0) analysis
+        sell_indices = np.where(y_test == 0)[0]
+        if len(sell_indices) > 0:
+            sell_preds = y_pred[sell_indices]
+            sell_acc = np.mean(sell_preds == 0)
+            sell_confusion = np.bincount(sell_preds, minlength=3)
+            print(f"  Sell class ({len(sell_indices)} samples):")
+            print(f"    Accuracy: {sell_acc:.4f}")
+            print(f"    Predicted as: Sell: {sell_confusion[0]} ({sell_confusion[0]/len(sell_indices)*100:.1f}%), " +
+                  f"Hold: {sell_confusion[1]} ({sell_confusion[1]/len(sell_indices)*100:.1f}%), " +
+                  f"Buy: {sell_confusion[2]} ({sell_confusion[2]/len(sell_indices)*100:.1f}%)")
+
+            # Analysis of probabilities for Sell class
+            sell_probs = y_pred_proba[sell_indices]
+            avg_probs = np.mean(sell_probs, axis=0)
+            print(f"    Average probabilities: Sell: {avg_probs[0]:.4f}, Hold: {avg_probs[1]:.4f}, Buy: {avg_probs[2]:.4f}")
+            print(f"    Probability margin: {avg_probs[0] - np.max(avg_probs[1:]):.4f}")
+
+        # Buy class (2) analysis
+        buy_indices = np.where(y_test == 2)[0]
+        if len(buy_indices) > 0:
+            buy_preds = y_pred[buy_indices]
+            buy_acc = np.mean(buy_preds == 2)
+            buy_confusion = np.bincount(buy_preds, minlength=3)
+            print(f"  Buy class ({len(buy_indices)} samples):")
+            print(f"    Accuracy: {buy_acc:.4f}")
+            print(f"    Predicted as: Sell: {buy_confusion[0]} ({buy_confusion[0]/len(buy_indices)*100:.1f}%), " +
+                  f"Hold: {buy_confusion[1]} ({buy_confusion[1]/len(buy_indices)*100:.1f}%), " +
+                  f"Buy: {buy_confusion[2]} ({buy_confusion[2]/len(buy_indices)*100:.1f}%)")
+
+            # Analysis of probabilities for Buy class
+            buy_probs = y_pred_proba[buy_indices]
+            avg_probs = np.mean(buy_probs, axis=0)
+            print(f"    Average probabilities: Sell: {avg_probs[0]:.4f}, Hold: {avg_probs[1]:.4f}, Buy: {avg_probs[2]:.4f}")
+            print(f"    Probability margin: {avg_probs[2] - np.max(avg_probs[:2]):.4f}")
+
         # Calculate balanced accuracy (average of per-class accuracies)
         valid_accuracies = class_accuracy[~np.isnan(class_accuracy)]
         balanced_acc = np.mean(valid_accuracies) if len(valid_accuracies) > 0 else 0
@@ -826,26 +902,40 @@ class BoostModel:
             print("ERROR: Model not available. Run train() first.")
             return None
 
-        # Get feature importance scores
-        importance = self.model.get_score(importance_type='gain')
+        try:
+            # Get feature importance scores
+            importance = self.model.get_score(importance_type='gain')
 
-        # Create a DataFrame
-        importance_df = pd.DataFrame([
-            {'Feature': feature, 'Importance': score}
-            for feature, score in importance.items()
-        ])
+            # Check if we got any importance scores
+            if not importance:
+                print("WARNING: No feature importance scores available.")
+                # Create a dummy DataFrame with zero importance
+                dummy_data = {'Feature': [], 'Importance': [],
+                             'Relative Importance (%)': [], 'Cumulative Importance (%)': []}
+                return pd.DataFrame(dummy_data)
 
-        # Sort by importance
-        importance_df = importance_df.sort_values('Importance', ascending=False)
+            # Create a DataFrame
+            importance_df = pd.DataFrame([
+                {'Feature': feature, 'Importance': score}
+                for feature, score in importance.items()
+            ])
 
-        # Calculate relative importance as percentage
-        total_importance = importance_df['Importance'].sum()
-        importance_df['Relative Importance (%)'] = (importance_df['Importance'] / total_importance) * 100
+            # Sort by importance
+            importance_df = importance_df.sort_values('Importance', ascending=False)
 
-        # Calculate cumulative importance
-        importance_df['Cumulative Importance (%)'] = importance_df['Relative Importance (%)'].cumsum()
+            # Calculate relative importance as percentage
+            total_importance = importance_df['Importance'].sum()
+            importance_df['Relative Importance (%)'] = (importance_df['Importance'] / total_importance) * 100
 
-        return importance_df
+            # Calculate cumulative importance
+            importance_df['Cumulative Importance (%)'] = importance_df['Relative Importance (%)'].cumsum()
+
+            return importance_df
+
+        except Exception as e:
+            print(f"ERROR calculating feature importance: {e}")
+            return pd.DataFrame(columns=['Feature', 'Importance',
+                                        'Relative Importance (%)', 'Cumulative Importance (%)'])
 
     def filter_features(self, X_train, X_val=None, X_test=None, importance_threshold=90):
         """
