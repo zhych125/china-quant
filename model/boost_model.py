@@ -333,21 +333,21 @@ class BoostModel:
         # Set explicit weights to moderately favor Sell and Buy classes
         # Sell = 0, Hold = 1, Buy = 2
         class_weights = {
-            0: 1.5,  # Moderate boost for Sell class
-            1: 0.5,  # Slightly reduce weight for Hold class
-            2: 1.5   # Moderate boost for Buy class
+            0: 1.1,  # Moderate boost for Sell class
+            1: 0.75,  # Slightly reduce weight for Hold class
+            2: 1.1   # Moderate boost for Buy class
         }
 
         # Make sure all classes have weights
-        for class_idx in class_counts.index:
-            if class_idx not in class_weights:
-                class_weights[class_idx] = 1.0
+        # for class_idx in class_counts.index:
+        #     if class_idx not in class_weights:
+        #         class_weights[class_idx] = 1.0
 
-        print(f"Applied moderate boosting to Sell and Buy classes, slightly reduced Hold class weight")
+        # print(f"Applied moderate boosting to Sell and Buy classes, slightly reduced Hold class weight")
 
         # Normalize weights so they sum to number of classes
-        weight_sum = sum(class_weights.values())
-        class_weights = {k: v * len(class_weights) / weight_sum for k, v in class_weights.items()}
+        # weight_sum = sum(class_weights.values())
+        # class_weights = {k: v * len(class_weights) / weight_sum for k, v in class_weights.items()}
 
         print("\nFinal class weights:")
         for class_idx, weight in class_weights.items():
@@ -602,51 +602,9 @@ class BoostModel:
         # Get the predicted class (0, 1, or 2 for sell, hold, buy)
         y_pred = np.argmax(y_pred_proba, axis=1)
 
-        # Apply margin-based prediction override
-        # When the margin between highest probability and second highest probability is small,
-        # we override to Hold class (1) since we're not confident enough in the prediction
-        margin_threshold = 0.15  # Minimum confidence margin required
-
-        # Get the original predictions for comparison
-        original_pred = y_pred.copy()
-
-        # For each prediction, calculate the margin between top and second probabilities
-        margins = []
-        for i in range(len(y_pred_proba)):
-            # Sort probabilities in descending order
-            sorted_probs = np.sort(y_pred_proba[i])[::-1]
-            # Margin is difference between highest and second highest probability
-            margin = sorted_probs[0] - sorted_probs[1]
-            margins.append(margin)
-
-            # If margin is below threshold and prediction is not already Hold,
-            # override to Hold class
-            if margin < margin_threshold and y_pred[i] != 1:
-                y_pred[i] = 1  # Override to Hold
-
-        # Calculate how many predictions were overridden
-        overrides = np.sum(y_pred != original_pred)
-        override_pct = (overrides / len(y_pred)) * 100
-
-        print(f"\nMargin-based prediction overrides:")
-        print(f"  Threshold: {margin_threshold}")
-        print(f"  Predictions overridden: {overrides} ({override_pct:.2f}%)")
-        print(f"  Average margin: {np.mean(margins):.4f}")
-
-        # Show distribution of overridden predictions
-        if overrides > 0:
-            override_indices = np.where(y_pred != original_pred)[0]
-            original_classes = original_pred[override_indices]
-            override_counts = np.bincount(original_classes, minlength=3)
-            print("\nOverridden prediction distribution:")
-            for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
-                count = override_counts[i]
-                percent = count / overrides * 100 if overrides > 0 else 0
-                print(f"  {class_name} ({i}) → Hold: {count} predictions ({percent:.2f}%)")
-
         # Check predicted class distribution
         pred_counts = np.bincount(y_pred, minlength=3)
-        print("\nPredicted class distribution (after margin override):")
+        print("\nPredicted class distribution:")
         for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
             count = pred_counts[i]
             percent = count / len(y_pred) * 100
@@ -963,51 +921,9 @@ class BoostModel:
         # Get the predicted class (0, 1, or 2 for sell, hold, buy)
         y_pred = np.argmax(y_pred_proba, axis=1)
 
-        # Apply margin-based prediction override
-        # When the margin between highest probability and second highest probability is small,
-        # we override to Hold class (1) since we're not confident enough in the prediction
-        margin_threshold = 0.12  # Minimum confidence margin required
-
-        # Get the original predictions for comparison
-        original_pred = y_pred.copy()
-
-        # For each prediction, calculate the margin between top and second probabilities
-        margins = []
-        for i in range(len(y_pred_proba)):
-            # Sort probabilities in descending order
-            sorted_probs = np.sort(y_pred_proba[i])[::-1]
-            # Margin is difference between highest and second highest probability
-            margin = sorted_probs[0] - sorted_probs[1]
-            margins.append(margin)
-
-            # If margin is below threshold and prediction is not already Hold,
-            # override to Hold class
-            if margin < margin_threshold and y_pred[i] != 1:
-                y_pred[i] = 1  # Override to Hold
-
-        # Calculate how many predictions were overridden
-        overrides = np.sum(y_pred != original_pred)
-        override_pct = (overrides / len(y_pred)) * 100
-
-        print(f"\nMargin-based prediction overrides:")
-        print(f"  Threshold: {margin_threshold}")
-        print(f"  Predictions overridden: {overrides} ({override_pct:.2f}%)")
-        print(f"  Average margin: {np.mean(margins):.4f}")
-
-        # Show distribution of overridden predictions
-        if overrides > 0:
-            override_indices = np.where(y_pred != original_pred)[0]
-            original_classes = original_pred[override_indices]
-            override_counts = np.bincount(original_classes, minlength=3)
-            print("\nOverridden prediction distribution:")
-            for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
-                count = override_counts[i]
-                percent = count / overrides * 100 if overrides > 0 else 0
-                print(f"  {class_name} ({i}) → Hold: {count} predictions ({percent:.2f}%)")
-
         # Check predicted class distribution
         pred_counts = np.bincount(y_pred, minlength=3)
-        print("\nPredicted class distribution (after margin override):")
+        print("\nPredicted class distribution:")
         for i, class_name in enumerate(['Sell', 'Hold', 'Buy']):
             count = pred_counts[i]
             percent = count / len(y_pred) * 100
